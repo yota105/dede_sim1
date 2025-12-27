@@ -9,7 +9,7 @@ import dataclasses
 import json
 import math
 import pathlib
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 
@@ -319,7 +319,7 @@ class TaichiHeightField:
         self.h.from_numpy(self.h_np)
 
     @ti.kernel
-    def _grad_mag_kernel(self, dx: ti.f32, dy: ti.f32):
+    def _grad_mag_kernel(self, dx: ti.f32, dy: ti.f32):  # type: ignore[reportInvalidTypeForm]
         for i, j in ti.ndrange(self.nx, self.ny):
             ip = min(i + 1, self.nx - 1)
             im = max(i - 1, 0)
@@ -331,7 +331,7 @@ class TaichiHeightField:
             self.grad[i, j] = ti.min(1e3, ti.max(0.0, g))
 
     @ti.kernel
-    def _step_kernel(self, dt: ti.f32, g: ti.f32, damping: ti.f32, nu_h: ti.f32, h_nu: ti.f32, h_damp: ti.f32, dx: ti.f32, dy: ti.f32):
+    def _step_kernel(self, dt: ti.f32, g: ti.f32, damping: ti.f32, nu_h: ti.f32, h_nu: ti.f32, h_damp: ti.f32, dx: ti.f32, dy: ti.f32):  # type: ignore[reportInvalidTypeForm]
         for i, j in ti.ndrange(self.nx, self.ny):
             # gradients
             ip = min(i + 1, self.nx - 1)
@@ -374,7 +374,7 @@ class TaichiHeightField:
             self.h[i, j] = ti.min(0.5, ti.max(-0.5, h_new))
 
     @ti.kernel
-    def _edge_damp(self, mask: ti.types.ndarray()):
+    def _edge_damp(self, mask: Any):
         for i, j in ti.ndrange(self.nx, self.ny):
             m = mask[i, j]
             self.h[i, j] *= 1.0 - m
