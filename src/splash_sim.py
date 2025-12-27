@@ -3,7 +3,6 @@
 Generates droplet reimpact events with estimated pitch (Hz) using a
 lightweight heightfield update and ballistic droplet particles.
 """
-from __future__ import annotations
 
 import argparse
 import dataclasses
@@ -13,6 +12,11 @@ import pathlib
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
+
+try:  # Optional GPU/CPU acceleration
+    import taichi as ti
+except ImportError:  # noqa: E722
+    ti = None
 
 
 @dataclasses.dataclass
@@ -30,8 +34,10 @@ class WaterConfig:
     rho_water: float = 1000.0
     g: float = 9.81
     water_depth0: float = 0.2
-    nu_h: float = 0.01  # viscosity-like term for U
-    damping: float = 0.1  # velocity damping in the momentum equation
+    nu_h: float = 0.08  # viscosity-like term for U
+    damping: float = 0.7  # velocity damping in the momentum equation
+    h_nu: float = 0.06  # viscosity-like term for height field
+    h_damp: float = 0.7  # decay factor for height field (per second)
 
 
 @dataclasses.dataclass
@@ -54,6 +60,11 @@ class SpawnConfig:
     mu_r: float = -5.3  # lognormal mu
     sigma_r: float = 0.35  # lognormal sigma
     max_particles: int = 2000
+    jet_grad_thresh: float = 0.12  # slope threshold for jet-driven spawn
+    jet_spawn_scale: float = 20.0  # scaling from slope strength to rate
+    jet_per_step_cap: int = 80  # cap per step to avoid explosion
+    jet_max_lambda: float = 300.0  # safety cap for Poisson mean
+    jet_eval_every: int = 2  # evaluate jet gradients every N steps
 
 
 @dataclasses.dataclass
@@ -79,15 +90,16 @@ class OutputConfig:
 
 @dataclasses.dataclass
 class SimConfig:
-    domain: DomainConfig = DomainConfig()
-    water: WaterConfig = WaterConfig()
-    rock: RockConfig = RockConfig()
-    spawn: SpawnConfig = SpawnConfig()
-    droplet: DropletPhysics = DropletPhysics()
-    pitch: PitchConfig = PitchConfig()
-    output: OutputConfig = OutputConfig()
+    domain: DomainConfig = dataclasses.field(default_factory=DomainConfig)
+    water: WaterConfig = dataclasses.field(default_factory=WaterConfig)
+    rock: RockConfig = dataclasses.field(default_factory=RockConfig)
+    spawn: SpawnConfig = dataclasses.field(default_factory=SpawnConfig)
+    droplet: DropletPhysics = dataclasses.field(default_factory=DropletPhysics)
+    pitch: PitchConfig = dataclasses.field(default_factory=PitchConfig)
+    output: OutputConfig = dataclasses.field(default_factory=OutputConfig)
     n_min: int = 50  # target minimum event count
     seed: int = 7
+    engine: str = "numpy"  # "numpy" or "taichi"
 
 
 @dataclasses.dataclass
@@ -121,6 +133,8 @@ class HeightField:
         self.h = np.zeros((nx, ny), dtype=np.float32)  # deviation from H0
         self.u = np.zeros_like(self.h)
         self.v = np.zeros_like(self.h)
+        self._grad_cache = None
+        self._grad_cache_step = -1
 
     def apply_impulse(self, rng: np.random.Generator) -> None:
         cfg = self.cfg
@@ -142,13 +156,27 @@ class HeightField:
         impulse = base * kernel
 
         # Deposit impulse into velocity as downward push represented by h change.
-        self.h -= impulse * 1e-4  # scale down to keep stability
+        self.h -= impulse * 1e-5  # reduced to keep stability
+
+    def grad_magnitude(self) -> np.ndarray:
+        dhdx = self._grad(self.h, axis=0, dx=self.dx)
+        dhdy = self._grad(self.h, axis=1, dx=self.dy)
+        mag = np.sqrt(dhdx * dhdx + dhdy * dhdy)
+        return np.nan_to_num(np.clip(mag, 0.0, 1e3))
+
+    def grad_magnitude_cached(self, step: int, eval_every: int) -> np.ndarray:
+        if self._grad_cache is None or step - self._grad_cache_step >= eval_every:
+            self._grad_cache = self.grad_magnitude()
+            self._grad_cache_step = step
+        return self._grad_cache
 
     def step(self, dt: float) -> None:
         cfg = self.cfg
         g = cfg.water.g
         damping = cfg.water.damping
         nu_h = cfg.water.nu_h
+        h_nu = cfg.water.h_nu
+        h_damp = cfg.water.h_damp
 
         dhdx = self._grad(self.h, axis=0, dx=self.dx)
         dhdy = self._grad(self.h, axis=1, dx=self.dy)
@@ -156,9 +184,18 @@ class HeightField:
         self.u -= dt * (g * dhdx + damping * self.u) + dt * nu_h * self._laplacian(self.u, self.dx, self.dy)
         self.v -= dt * (g * dhdy + damping * self.v) + dt * nu_h * self._laplacian(self.v, self.dx, self.dy)
 
-        # Update height
+        # Update height with diffusion and damping
         div_hu = self._divergence(self.h * self.u, self.h * self.v, self.dx, self.dy)
         self.h -= dt * div_hu
+        if h_nu > 0.0:
+            self.h += h_nu * self._laplacian(self.h, self.dx, self.dy) * dt
+        if h_damp > 0.0:
+            self.h *= (1.0 - h_damp * dt)
+
+        # Clamp to avoid numerical blow-up.
+        self.h = np.clip(self.h, -0.5, 0.5)
+        self.u = np.clip(self.u, -5.0, 5.0)
+        self.v = np.clip(self.v, -5.0, 5.0)
 
         if self.cfg.domain.boundary == "damped":
             self._apply_edge_damping()
@@ -231,11 +268,188 @@ class HeightField:
         self.v *= 1.0 - mask
 
 
+@ti.data_oriented
+class TaichiHeightField:
+    def __init__(self, cfg: SimConfig):
+        if ti is None:
+            raise RuntimeError("Taichi not available; please install taichi or use engine='numpy'")
+        self.cfg = cfg
+        nx, ny = cfg.domain.grid_res
+        arch = ti.gpu if ti._lib.core.with_cuda() else ti.cpu
+        ti.init(arch=arch, random_seed=cfg.seed, device_memory_fraction=0.9)
+        self.dx = cfg.domain.domain_size[0] / nx
+        self.dy = cfg.domain.domain_size[1] / ny
+        self.h = ti.field(dtype=ti.f32, shape=(nx, ny))
+        self.u = ti.field(dtype=ti.f32, shape=(nx, ny))
+        self.v = ti.field(dtype=ti.f32, shape=(nx, ny))
+        self.h_np = np.zeros((nx, ny), dtype=np.float32)
+        self.nx, self.ny = nx, ny
+        self._edge_mask = self._build_edge_mask()
+        self.grad = ti.field(dtype=ti.f32, shape=(nx, ny))
+        self._grad_cache = None
+        self._grad_cache_step = -1
+
+    def _build_edge_mask(self) -> np.ndarray:
+        edge = self.cfg.domain.damping_edge
+        nx, ny = self.cfg.domain.grid_res
+        ramp_x = np.minimum(np.arange(nx), np.arange(nx)[::-1]) / max(nx - 1, 1)
+        ramp_y = np.minimum(np.arange(ny), np.arange(ny)[::-1]) / max(ny - 1, 1)
+        mask_x = np.clip((edge - ramp_x) / edge, 0.0, 1.0)
+        mask_y = np.clip((edge - ramp_y) / edge, 0.0, 1.0)
+        mask = np.maximum(mask_x[:, None], mask_y[None, :]).astype(np.float32)
+        return mask
+
+    def apply_impulse(self, rng: np.random.Generator) -> None:
+        cfg = self.cfg
+        rock = cfg.rock
+        x0, y0 = rock.center
+        nx, ny = cfg.domain.grid_res
+        xs = (np.arange(nx) + 0.5) * self.dx
+        ys = (np.arange(ny) + 0.5) * self.dy
+        X, Y = np.meshgrid(xs, ys, indexing="ij")
+        dist = np.sqrt((X - x0) ** 2 + (Y - y0) ** 2)
+        r_eff = rock.rock_radius
+        v_imp = math.sqrt(max(0.0, rock.drop_velocity0**2 + 2 * cfg.water.g * rock.drop_height))
+        area = math.pi * r_eff * r_eff
+        base = rock.impulse_scale * rock.rock_mass * v_imp / max(area, 1e-6)
+        noise = rock.noise_amp * rng.normal(size=dist.shape)
+        kernel = np.exp(-((dist / r_eff) ** 2)) * (1.0 + noise)
+        impulse = base * kernel
+        self.h_np -= impulse * 1e-5
+        self.h.from_numpy(self.h_np)
+
+    @ti.kernel
+    def _grad_mag_kernel(self, dx: ti.f32, dy: ti.f32):
+        for i, j in ti.ndrange(self.nx, self.ny):
+            ip = min(i + 1, self.nx - 1)
+            im = max(i - 1, 0)
+            jp = min(j + 1, self.ny - 1)
+            jm = max(j - 1, 0)
+            dhdx = (self.h[ip, j] - self.h[im, j]) / (dx if (ip == im) else (2 * dx))
+            dhdy = (self.h[i, jp] - self.h[i, jm]) / (dy if (jp == jm) else (2 * dy))
+            g = ti.sqrt(dhdx * dhdx + dhdy * dhdy)
+            self.grad[i, j] = ti.min(1e3, ti.max(0.0, g))
+
+    @ti.kernel
+    def _step_kernel(self, dt: ti.f32, g: ti.f32, damping: ti.f32, nu_h: ti.f32, h_nu: ti.f32, h_damp: ti.f32, dx: ti.f32, dy: ti.f32):
+        for i, j in ti.ndrange(self.nx, self.ny):
+            # gradients
+            ip = min(i + 1, self.nx - 1)
+            im = max(i - 1, 0)
+            jp = min(j + 1, self.ny - 1)
+            jm = max(j - 1, 0)
+            dhdx = (self.h[ip, j] - self.h[im, j]) / (dx if (ip == im) else (2 * dx))
+            dhdy = (self.h[i, jp] - self.h[i, jm]) / (dy if (jp == jm) else (2 * dy))
+
+            lap_u = (self.u[ip, j] - 2 * self.u[i, j] + self.u[im, j]) / (dx * dx) + (
+                self.u[i, jp] - 2 * self.u[i, j] + self.u[i, jm]
+            ) / (dy * dy)
+            lap_v = (self.v[ip, j] - 2 * self.v[i, j] + self.v[im, j]) / (dx * dx) + (
+                self.v[i, jp] - 2 * self.v[i, j] + self.v[i, jm]
+            ) / (dy * dy)
+
+            u_new = self.u[i, j] - dt * (g * dhdx + damping * self.u[i, j]) + dt * nu_h * lap_u
+            v_new = self.v[i, j] - dt * (g * dhdy + damping * self.v[i, j]) + dt * nu_h * lap_v
+
+            self.u[i, j] = ti.min(5.0, ti.max(-5.0, u_new))
+            self.v[i, j] = ti.min(5.0, ti.max(-5.0, v_new))
+
+        ti.loop_config(serialize=True)
+        for i, j in ti.ndrange(self.nx, self.ny):
+            ip = min(i + 1, self.nx - 1)
+            im = max(i - 1, 0)
+            jp = min(j + 1, self.ny - 1)
+            jm = max(j - 1, 0)
+            div_hu = (self.h[ip, j] * self.u[ip, j] - self.h[im, j] * self.u[im, j]) / (2 * dx) + (
+                self.h[i, jp] * self.v[i, jp] - self.h[i, jm] * self.v[i, jm]
+            ) / (2 * dy)
+            h_new = self.h[i, j] - dt * div_hu
+            if h_nu > 0:
+                lap_h = (self.h[ip, j] - 2 * self.h[i, j] + self.h[im, j]) / (dx * dx) + (
+                    self.h[i, jp] - 2 * self.h[i, j] + self.h[i, jm]
+                ) / (dy * dy)
+                h_new += h_nu * lap_h * dt
+            if h_damp > 0:
+                h_new *= (1.0 - h_damp * dt)
+            self.h[i, j] = ti.min(0.5, ti.max(-0.5, h_new))
+
+    @ti.kernel
+    def _edge_damp(self, mask: ti.types.ndarray()):
+        for i, j in ti.ndrange(self.nx, self.ny):
+            m = mask[i, j]
+            self.h[i, j] *= 1.0 - m
+            self.u[i, j] *= 1.0 - m
+            self.v[i, j] *= 1.0 - m
+
+    def step(self, dt: float) -> None:
+        cfg = self.cfg
+        self._step_kernel(dt, cfg.water.g, cfg.water.damping, cfg.water.nu_h, cfg.water.h_nu, cfg.water.h_damp, self.dx, self.dy)
+        if cfg.domain.boundary == "damped":
+            self._edge_damp(self._edge_mask)
+        self.h_np = self.h.to_numpy()
+
+    def grad_magnitude(self) -> np.ndarray:
+        self._grad_mag_kernel(self.dx, self.dy)
+        return self.grad.to_numpy()
+
+    def grad_magnitude_cached(self, step: int, eval_every: int) -> np.ndarray:
+        if self._grad_cache is None or step - self._grad_cache_step >= eval_every:
+            self._grad_cache = self.grad_magnitude()
+            self._grad_cache_step = step
+        return self._grad_cache
+
+    def _grad_np(self, field: np.ndarray, axis: int, dx: float) -> np.ndarray:
+        out = np.zeros_like(field)
+        if axis == 0:
+            out[1:-1, :] = (field[2:, :] - field[:-2, :]) / (2 * dx)
+            out[0, :] = (field[1, :] - field[0, :]) / dx
+            out[-1, :] = (field[-1, :] - field[-2, :]) / dx
+        else:
+            out[:, 1:-1] = (field[:, 2:] - field[:, :-2]) / (2 * dx)
+            out[:, 0] = (field[:, 1] - field[:, 0]) / dx
+            out[:, -1] = (field[:, -1] - field[:, -2]) / dx
+        return out
+
+    def surface_height(self, x: float, y: float, H0: float) -> float:
+        h = self._bilinear(self.h_np, x, y) if self._inside(x, y) else 0.0
+        return H0 + h
+
+    def _inside(self, x: float, y: float) -> bool:
+        Lx, Ly = self.cfg.domain.domain_size
+        return 0.0 <= x < Lx and 0.0 <= y < Ly
+
+    def _bilinear(self, field: np.ndarray, x: float, y: float) -> float:
+        nx, ny = field.shape
+        fx = x / self.dx - 0.5
+        fy = y / self.dy - 0.5
+        i0 = int(np.floor(fx))
+        j0 = int(np.floor(fy))
+        i1 = min(i0 + 1, nx - 1)
+        j1 = min(j0 + 1, ny - 1)
+        sx = fx - i0
+        sy = fy - j0
+        i0 = np.clip(i0, 0, nx - 1)
+        j0 = np.clip(j0, 0, ny - 1)
+        v00 = field[i0, j0]
+        v10 = field[i1, j0]
+        v01 = field[i0, j1]
+        v11 = field[i1, j1]
+        return (1 - sx) * (1 - sy) * v00 + sx * (1 - sy) * v10 + (1 - sx) * sy * v01 + sx * sy * v11
+
+
 class Simulator:
     def __init__(self, cfg: SimConfig):
         self.cfg = cfg
         self.rng = np.random.default_rng(cfg.seed)
-        self.height = HeightField(cfg)
+        if cfg.engine == "taichi":
+            try:
+                self.height = TaichiHeightField(cfg)
+                print("Using Taichi backend")
+            except Exception as e:  # fallback to numpy
+                print(f"Taichi backend unavailable ({e}), falling back to numpy")
+                self.height = HeightField(cfg)
+        else:
+            self.height = HeightField(cfg)
         self.droplets: List[Droplet] = []
         self.events: List[Event] = []
         self.next_id = 0
@@ -248,11 +462,18 @@ class Simulator:
 
         t = 0.0
         step = 0
-        while t < cfg.domain.t_end:
+        base_end = cfg.domain.t_end
+        # Allow extra time so all droplets land: extend by droplet TTL plus margin.
+        extra_end = base_end + cfg.droplet.ttl + 0.5
+        while (t < base_end) or (self.droplets and t < extra_end):
             self.height.step(dt)
+            self._spawn_from_jets(t, dt, step)
             self._update_droplets(dt, t)
             t += dt
             step += 1
+
+            if cfg.output.log_every and step % cfg.output.log_every == 0:
+                print(f"t={t:.3f} s, events={len(self.events)}, droplets={len(self.droplets)}")
 
         return self.events
 
@@ -270,6 +491,54 @@ class Simulator:
             dir_xy = self.rng.normal(scale=spawn.lateral_noise, size=2)
             vel = np.array([dir_xy[0], dir_xy[1], vz], dtype=np.float32)
             self.droplets.append(Droplet(pos=pos.copy(), vel=vel, r=r, born_at=0.0, active=True, id=self.next_id))
+            self.next_id += 1
+
+    def _spawn_from_jets(self, t: float, dt: float, step: int) -> None:
+        cfg = self.cfg
+        spawn = cfg.spawn
+        grad_mag = self.height.grad_magnitude_cached(step, spawn.jet_eval_every)
+        excess = grad_mag - spawn.jet_grad_thresh
+        mask = excess > 0.0
+        if not mask.any():
+            return
+
+        strength = float(excess[mask].sum())
+        expected = spawn.jet_spawn_scale * strength * dt
+        expected = min(expected, spawn.jet_max_lambda)
+        if expected <= 0.0:
+            return
+
+        available = max(0, spawn.max_particles - len(self.droplets))
+        if available == 0:
+            return
+
+        count = int(self.rng.poisson(expected))
+        if count <= 0:
+            return
+
+        count = min(count, available, spawn.jet_per_step_cap)
+        flat_indices = np.nonzero(mask.ravel())[0]
+        if flat_indices.size == 0:
+            return
+
+        weights = excess.ravel()[flat_indices]
+        probs = weights / max(weights.sum(), 1e-8)
+        choices = self.rng.choice(flat_indices, size=count, replace=flat_indices.size < count, p=probs)
+
+        nx, ny = grad_mag.shape
+        for idx in choices:
+            i = idx // ny
+            j = idx % ny
+            x = (i + float(self.rng.random())) * self.height.dx
+            y = (j + float(self.rng.random())) * self.height.dy
+            r = math.exp(self.rng.normal(spawn.mu_r, spawn.sigma_r))
+            vz = self.rng.uniform(spawn.vz_range[0], spawn.vz_range[1])
+            dir_xy = self.rng.normal(scale=spawn.lateral_noise, size=2)
+            pos = np.array([x, y, cfg.water.water_depth0], dtype=np.float32)
+            vel = np.array([dir_xy[0], dir_xy[1], vz], dtype=np.float32)
+            self.droplets.append(
+                Droplet(pos=pos, vel=vel, r=r, born_at=t, active=True, id=self.next_id)
+            )
             self.next_id += 1
 
     def _update_droplets(self, dt: float, t: float) -> None:
@@ -365,13 +634,22 @@ def _config_from_dict(raw: Dict) -> SimConfig:
         cfg.n_min = raw["n_min"]
     if "seed" in raw:
         cfg.seed = raw["seed"]
+    if "engine" in raw:
+        cfg.engine = raw["engine"]
     return cfg
 
 
 def save_events(events: Iterable[Event], path: pathlib.Path) -> None:
+    def _to_jsonable(ev: Event) -> Dict[str, float]:
+        data = dataclasses.asdict(ev)
+        for k, v in list(data.items()):
+            if isinstance(v, (np.floating, np.float32, np.float64)):
+                data[k] = float(v)
+        return data
+
     with path.open("w", encoding="utf-8") as f:
         for ev in events:
-            f.write(json.dumps(dataclasses.asdict(ev)) + "\n")
+            f.write(json.dumps(_to_jsonable(ev)) + "\n")
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -380,6 +658,7 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--out", type=pathlib.Path, help="Path to JSONL output", default=None)
     parser.add_argument("--n-min", type=int, help="Minimum desired event count", default=None)
     parser.add_argument("--seed", type=int, help="RNG seed", default=None)
+    parser.add_argument("--engine", type=str, choices=["numpy", "taichi"], help="Compute backend", default=None)
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config) if args.config else default_config()
@@ -389,16 +668,26 @@ def main(argv: List[str] | None = None) -> None:
         cfg.n_min = args.n_min
     if args.seed is not None:
         cfg.seed = args.seed
+    if args.engine is not None:
+        cfg.engine = args.engine
 
-    sim = Simulator(cfg)
-    events = sim.run()
-
-    # Optional simple retry by boosting spawn_rate if below target.
-    if len(events) < cfg.n_min:
-        factor = max(1.5, cfg.n_min / max(len(events), 1))
-        cfg.spawn.spawn_rate *= factor
+    attempt = 0
+    events: List[Event] = []
+    while True:
         sim = Simulator(cfg)
         events = sim.run()
+        if len(events) >= cfg.n_min or attempt >= 2:
+            break
+        deficit = cfg.n_min - len(events)
+        factor = max(1.3, cfg.n_min / max(len(events), 1))
+        cfg.spawn.spawn_rate = min(cfg.spawn.spawn_rate * factor, cfg.spawn.spawn_rate * 4.0)
+        cfg.rock.drop_height = min(cfg.rock.drop_height * 1.2, cfg.rock.drop_height * 3.0)
+        cfg.rock.noise_amp = min(cfg.rock.noise_amp * 1.2, 0.5)
+        attempt += 1
+        print(
+            f"Retry {attempt}: boosted spawn_rate={cfg.spawn.spawn_rate:.1f}, "
+            f"drop_height={cfg.rock.drop_height:.3f}, noise_amp={cfg.rock.noise_amp:.3f}"
+        )
 
     save_events(events, cfg.output.out_path)
     print(f"Generated {len(events)} events -> {cfg.output.out_path}")

@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+src/splash_sim.py
+src/synth_from_events.py
+src/dede_sim.egg-info/PKG-INFO
+src/dede_sim.egg-info/SOURCES.txt
+src/dede_sim.egg-info/dependency_links.txt
+src/dede_sim.egg-info/requires.txt
+src/dede_sim.egg-info/top_level.txt
